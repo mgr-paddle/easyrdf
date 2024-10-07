@@ -188,7 +188,7 @@ class Client
      *
      * @param string $query The update query string to be executed
      *
-     * @return Http\Response HTTP response
+     * @return Http\Response|\GuzzleHttp\Psr7\Response HTTP response
      */
     public function update($query)
     {
@@ -251,8 +251,20 @@ class Client
         $processed_query = $this->preprocessQuery($query);
         $response = $this->executeQuery($processed_query, $type);
 
-        if (!$response->isSuccessful()) {
+        // Determine if the response is successful
+        if ($response instanceof Http\Response) {
+            $isSuccessful = $response->isSuccessful();
+            $statusCode = $response->getStatus();
             $location = $response->getHeader('Location');
+        } elseif ($response instanceof \GuzzleHttp\Psr7\Response) {
+            $isSuccessful = $response->getStatusCode() >= 200 && $response->getStatusCode() < 300;
+            $statusCode = $response->getStatusCode();
+            $location = $response->getHeaderLine('Location');
+        } else {
+            throw new Http\Exception('Unsupported response type');
+        }
+
+        if (!$isSuccessful) {
             if ($location && !\in_array($location, $previousRedirections)) {
                 switch ($type) {
                     case 'query':
@@ -271,16 +283,18 @@ class Client
                 throw new Http\Exception('Circular redirection');
             }
 
-            throw new Http\Exception('HTTP request for SPARQL query failed', $response->getStatus(), null, $response->getBody());
+            // Use the appropriate exception based on the response type
+            throw new Http\Exception('HTTP request for SPARQL query failed', $statusCode, null, $response->getBody());
         }
 
-        if (204 == $response->getStatus()) {
+        if (204 == $statusCode) {
             // No content
             return $response;
         }
 
         return $this->parseResponseToQuery($response);
     }
+
 
     protected function convertToTriples($data)
     {
@@ -324,16 +338,20 @@ class Client
      * @param string $processed_query
      * @param string $type            Should be either "query" or "update"
      *
-     * @return Http\Response|\Zend\Http\Response|\Laminas\Http\Client
+     * @return Http\Response|\Zend\Http\Response|\Laminas\Http\Client|\GuzzleHttp\ClientInterface
      *
      * @throws Exception
      */
     protected function executeQuery($processed_query, $type)
     {
         $client = Http::getDefaultHttpClient();
-        $client->resetParameters();
 
-        // Tell the server which response formats we can parse
+        // Reset parameters if the client is not an instance of GuzzleHTTP.
+        if (!$client instanceof \GuzzleHttp\Client) {
+            $client->resetParameters();
+        }
+
+        // Define the headers for SPARQL results and graph types
         $sparql_results_types = [
             'application/sparql-results+json' => 1.0,
             'application/sparql-results+xml' => 0.8,
@@ -346,67 +364,95 @@ class Client
             'application/n-triples' => 0.7,
         ];
 
-        if ('update' == $type) {
-            // accept anything, as "response body of a […] update request is implementation defined"
-            // @see http://www.w3.org/TR/sparql11-protocol/#update-success
+        // Prepare headers and options
+        $headers = [];
+
+        if ('update' === $type) {
+            // SPARQL update query
             $accept = Format::getHttpAcceptHeader($sparql_results_types);
-            $this->setHeaders($client, 'Accept', $accept);
+            $headers['Accept'] = $accept;
+            $headers['Content-Type'] = 'application/sparql-update';
 
-            $client->setMethod('POST');
-            $client->setUri($this->updateUri);
-            $client->setRawData($processed_query);
-            $this->setHeaders($client, 'Content-Type', 'application/sparql-update');
-        } elseif ('query' == $type) {
-            $re = '(?:(?:\s*BASE\s*<.*?>\s*)|(?:\s*PREFIX\s+.+:\s*<.*?>\s*))*'.
-                '(CONSTRUCT|SELECT|ASK|DESCRIBE)[\W]';
+            // Use Guzzle or Laminas to send the request
+            $options = ['headers' => $headers, 'body' => $processed_query];
 
-            $result = null;
-            $matched = mb_eregi($re, $processed_query, $result);
+            return $this->sendRequest($client, $this->updateUri, 'POST', $options);
 
-            if (false == $matched || 2 !== \count($result)) {
-                // non-standard query. is this something non-standard?
-                $query_verb = null;
+        } elseif ('query' === $type) {
+            // Handle SPARQL query logic
+            $query_verb = $this->determineQueryVerb($processed_query, $sparql_results_types, $sparql_graph_types);
+            $accept = $this->determineAcceptHeader($query_verb, $sparql_results_types, $sparql_graph_types);
+            $headers['Accept'] = $accept;
+
+            // Encode the query for GET or POST
+            $encodedQuery = 'query=' . urlencode($processed_query);
+            $delimiter = $this->queryUri_has_params ? '&' : '?';
+
+            // Decide whether to use GET or POST
+            if (strlen($encodedQuery) + strlen($this->queryUri) <= 2046) {
+                // Use GET request
+                return $this->sendRequest($client, $this->queryUri . $delimiter . $encodedQuery, 'GET', ['headers' => $headers]);
             } else {
-                $query_verb = strtoupper($result[1]);
-            }
-
-            if ('SELECT' === $query_verb || 'ASK' === $query_verb) {
-                // only "results"
-                $accept = Format::formatAcceptHeader($sparql_results_types);
-            } elseif ('CONSTRUCT' === $query_verb || 'DESCRIBE' === $query_verb) {
-                // only "graph"
-                $accept = Format::formatAcceptHeader($sparql_graph_types);
-            } else {
-                // both
-                $accept = Format::getHttpAcceptHeader($sparql_results_types);
-            }
-
-            $this->setHeaders($client, 'Accept', $accept);
-
-            $encodedQuery = 'query='.urlencode($processed_query);
-
-            // Use GET if the query is less than 2kB
-            // 2046 = 2kB minus 1 for '?' and 1 for NULL-terminated string on server
-            if (\strlen($encodedQuery) + \strlen($this->queryUri) <= 2046) {
-                $delimiter = $this->queryUri_has_params ? '&' : '?';
-
-                $client->setMethod('GET');
-                $client->setUri($this->queryUri.$delimiter.$encodedQuery);
-            } else {
-                // Fall back to POST instead (which is un-cacheable)
-                $client->setMethod('POST');
-                $client->setUri($this->queryUri);
-                $client->setRawData($encodedQuery);
-                $this->setHeaders($client, 'Content-Type', 'application/x-www-form-urlencoded');
+                // Use POST request
+                $headers['Content-Type'] = 'application/x-www-form-urlencoded';
+                return $this->sendRequest($client, $this->queryUri, 'POST', ['headers' => $headers, 'body' => $encodedQuery]);
             }
         } else {
-            throw new Exception('unexpected request-type: '.$type);
+            throw new Exception('unexpected request-type: ' . $type);
         }
+    }
 
-        if ($client instanceof Http\Client) {
-            return $client->request();
+    protected function sendRequest($client, $uri, $method, $options)
+    {
+        if ($client instanceof \GuzzleHttp\ClientInterface) {
+            try {
+                return $client->request($method, $uri, $options);
+            } catch (\GuzzleHttp\Exception\RequestException $e) {
+                throw new Exception('Guzzle HTTP request failed: ' . $e->getMessage());
+            }
+        } elseif ($client instanceof \Laminas\Http\Client
+            || $client instanceof \Zend\Http\Client
+            || $client instanceof Http\Client) {
+            $client->setMethod($method);
+            $client->setUri($uri);
+            if (isset($options['headers'])) {
+                foreach ($options['headers'] as $name => $value) {
+                    $client->setHeaders($name, $value);
+                }
+            }
+            if (isset($options['body'])) {
+                $client->setRawData($options['body']);
+            }
+            return $client->request(); // Execute the request
         } else {
-            return $client->send();
+            throw new Exception('Unsupported client type');
+        }
+    }
+
+    protected function determineQueryVerb($processed_query, $sparql_results_types, $sparql_graph_types)
+    {
+        $re = '(?:(?:\s*BASE\s*<.*?>\s*)|(?:\s*PREFIX\s+.+:\s*<.*?>\s*))*' .
+            '(CONSTRUCT|SELECT|ASK|DESCRIBE)[\W]';
+
+        $result = null;
+        $matched = mb_eregi($re, $processed_query, $result);
+
+        if (!$matched || 2 !== count($result)) {
+            // Non-standard query
+            return null;
+        } else {
+            return strtoupper($result[1]);
+        }
+    }
+
+    protected function determineAcceptHeader($query_verb, $sparql_results_types, $sparql_graph_types)
+    {
+        if ('SELECT' === $query_verb || 'ASK' === $query_verb) {
+            return Format::formatAcceptHeader($sparql_results_types);
+        } elseif ('CONSTRUCT' === $query_verb || 'DESCRIBE' === $query_verb) {
+            return Format::formatAcceptHeader($sparql_graph_types);
+        } else {
+            return Format::getHttpAcceptHeader($sparql_results_types);
         }
     }
 
@@ -415,27 +461,33 @@ class Client
      *
      * Can be overridden to do custom processing
      *
-     * @param Http\Response|\Zend\Http\Response $response
+     * @param Http\Response|\Zend\Http\Response|\GuzzleHttp\Psr7\Response $response
      *
      * @return Graph|Result
      */
     protected function parseResponseToQuery($response)
     {
-        list($content_type) = Utils::parseMimeType($response->getHeader('Content-Type'));
-
-        if (str_starts_with($content_type, 'application/sparql-results')) {
-            $result = new Result($response->getBody(), $content_type);
-
-            return $result;
+        // Check if the client is Guzzle or Laminas/Zend and retrieve Content-Type accordingly
+        if ($response instanceof \GuzzleHttp\Psr7\Response) {
+            $content_type = $response->getHeaderLine('Content-Type');
+            $responseBody = (string)$response->getBody(); // Convert Guzzle response body to string
         } else {
-            $result = new Graph($this->queryUri, $response->getBody(), $content_type);
+            $content_type = $response->getHeader('Content-Type');
+            $responseBody = $response->getBody();
+        }
 
-            return $result;
+        list($content_type) = Utils::parseMimeType($content_type);
+
+        // Check the content type to decide whether to return Result or Graph
+        if (str_starts_with($content_type, 'application/sparql-results')) {
+            return new Result($responseBody, $content_type);
+        } else {
+            return new Graph($this->queryUri, $responseBody, $content_type);
         }
     }
 
     /**
-     * Proxy function to allow usage of our Client as well as Zend\Http v2 and Laminas\Http.
+     * Proxy function to allow usage of our Client as well as Zend\Http v2, GuzzleHTTP and Laminas\Http.
      *
      * Zend\Http\Client only accepts an array as first parameter, but our Client wants a name-value pair.
      *

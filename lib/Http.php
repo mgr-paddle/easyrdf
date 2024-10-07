@@ -47,7 +47,7 @@ class Http
     /**
      * The default HTTP Client object
      *
-     * @var Http\Client|\Zend\Http\Client|\Laminas\Http\Client|null
+     * @var Http\Client|\Zend\Http\Client|\Laminas\Http\Client|\GuzzleHttp\ClientInterface|null
      */
     private static $defaultHttpClient;
 
@@ -55,7 +55,7 @@ class Http
      *
      * @param mixed $httpClient The new HTTP client object
      *
-     * @return \EasyRdf\Http\Client|\Zend\Http\Client|\Laminas\Http\Client The new HTTP client object
+     * @return \EasyRdf\Http\Client|\Zend\Http\Client|\Laminas\Http\Client|\GuzzleHttp\ClientInterface The new HTTP client object
      *
      * @throws \InvalidArgumentException
      *
@@ -65,6 +65,7 @@ class Http
     {
         if (
             $httpClient instanceof \Zend\Http\Client
+            || $httpClient instanceof \GuzzleHttp\ClientInterface
             || $httpClient instanceof Http\Client
             /*
              * PHPStan always complains:
@@ -87,7 +88,7 @@ class Http
      * If no HTTP Client has previously been set, then a new
      * default (EasyRdf\Http\Client) client will be created.
      *
-     * @return Http\Client|\Zend\Http\Client|\Laminas\Http\Client The HTTP client object
+     * @return Http\Client|\Zend\Http\Client|\Laminas\Http\Client|\GuzzleHttp\ClientInterface The HTTP client object
      */
     public static function getDefaultHttpClient()
     {
