@@ -1,5 +1,5 @@
 {
-    "name": "sweetrdf/easyrdf",
+    "name": "mgr-paddle/easyrdf",
     "description": "EasyRdf is a PHP library designed to make it easy to consume and produce RDF.",
     "type": "library",
     "keywords": ["RDF", "Semantic Web", "Linked Data", "Turtle", "RDFa", "SPARQL"],
